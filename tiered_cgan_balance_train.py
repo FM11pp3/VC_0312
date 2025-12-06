@@ -19,6 +19,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -36,6 +37,7 @@ DATA_DIR = Path("/content/InfraredSolarModules") if Path("/content").exists() el
 DATA_URL = "https://github.com/RaptorMaps/InfraredSolarModules/raw/master/2020-02-14_InfraredSolarModules.zip"
 BASE_IMAGE_DIR = DATA_DIR / "images"
 TRAIN_CSV = REPO_ROOT / "full_train_data_list.csv"
+FINAL_TEST_CSV = REPO_ROOT / "final_test_data_list.csv"
 MODELS_DIR = REPO_ROOT / "models"
 METRICS_DIR = REPO_ROOT / "metrics"
 CGAN_WEIGHTS = REPO_ROOT / "cgan_generated_outputs" / "cgan_generator_minority_classes.pth"
@@ -77,6 +79,15 @@ def load_dataframes():
     anomaly_classes = sorted([c for c in classes_map if c != "No-Anomaly"])
     classes_map_B = {cls: idx for idx, cls in enumerate(anomaly_classes)}
     return train_df, classes_map, idx_to_class, anomaly_classes, classes_map_B
+
+
+def load_final_test_df() -> pd.DataFrame:
+    """Carrega o CSV de teste final e ajusta caminhos para o diretório local."""
+    ensure_dataset()
+    test_df = pd.read_csv(FINAL_TEST_CSV)
+    test_df["filename"] = test_df["path"].apply(lambda p: Path(p).name)
+    test_df["path"] = test_df["filename"].apply(lambda n: BASE_IMAGE_DIR / n)
+    return test_df
 
 
 base_transform = T.Compose(
@@ -202,6 +213,36 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> float:
     return correct / total if total else 0.0
 
 
+def evaluate_loader_metrics(model: nn.Module, loader: DataLoader, criterion: nn.Module | None = None) -> dict:
+    """Calcula loss, accuracy e f1 num loader completo."""
+    model.eval()
+    total_loss = 0.0
+    total = 0
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for images, labels in loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            logits = model(images)
+            if criterion is not None:
+                loss = criterion(logits, labels)
+                total_loss += loss.item() * labels.size(0)
+            preds = logits.argmax(1)
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
+            total += labels.size(0)
+    if total == 0:
+        return {"loss": 0.0, "accuracy": 0.0, "f1_macro": 0.0, "f1_micro": 0.0, "f1_weighted": 0.0}
+    preds_np = torch.cat(all_preds).numpy()
+    labels_np = torch.cat(all_labels).numpy()
+    return {
+        "loss": total_loss / total if criterion is not None else 0.0,
+        "accuracy": accuracy_score(labels_np, preds_np),
+        "f1_macro": f1_score(labels_np, preds_np, average="macro", zero_division=0),
+        "f1_micro": f1_score(labels_np, preds_np, average="micro", zero_division=0),
+        "f1_weighted": f1_score(labels_np, preds_np, average="weighted", zero_division=0),
+    }
+
+
 def tier_target(count: int, thresholds=(500, 1000, 1500)) -> int:
     if count < thresholds[0]:
         return thresholds[0]
@@ -286,6 +327,29 @@ def build_train_df(base_df: pd.DataFrame, base_key: str, classes_map: dict, clas
     return df.reset_index(drop=True)
 
 
+def plot_training_curves(history_df: pd.DataFrame, out_path: Path, model_name: str):
+    """Salva curvas de perda/metricas para anexar no relatório."""
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    axes[0].plot(history_df["epoch"], history_df["train_loss"], label="Train loss", marker="o")
+    axes[0].plot(history_df["epoch"], history_df["val_loss"], label="Val loss", marker="o")
+    axes[0].set_title(f"{model_name} - Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend()
+
+    axes[1].plot(history_df["epoch"], history_df["val_acc"], label="Val acc", marker="o")
+    axes[1].plot(history_df["epoch"], history_df["val_f1_macro"], label="Val f1_macro", marker="o")
+    axes[1].set_title(f"{model_name} - Metrics")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Score")
+    axes[1].legend()
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def train_model(model_name: str, base_df: pd.DataFrame, num_classes: int, epochs: int = 3, lr: float = 1e-3, use_weighted_sampler: bool = True, batch_size: int = 128):
     train_split, val_split = train_test_split(
         base_df,
@@ -307,9 +371,11 @@ def train_model(model_name: str, base_df: pd.DataFrame, num_classes: int, epochs
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
 
+    history = []
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
+        seen = 0
         for images, labels in train_loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
@@ -317,14 +383,29 @@ def train_model(model_name: str, base_df: pd.DataFrame, num_classes: int, epochs
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * labels.size(0)
-        val_acc = evaluate_model(model, val_loader)
-        print(f"{model_name} | Epoch {epoch + 1}/{epochs} | loss={running_loss / len(train_loader.dataset):.4f} | val_acc={val_acc:.3f}")
+            seen += labels.size(0)
+        train_loss = running_loss / seen if seen else 0.0
+        val_metrics = evaluate_loader_metrics(model, val_loader, criterion)
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "val_loss": val_metrics["loss"],
+                "val_acc": val_metrics["accuracy"],
+                "val_f1_macro": val_metrics["f1_macro"],
+            }
+        )
+        print(
+            f"{model_name} | Epoch {epoch + 1}/{epochs} | "
+            f"loss={train_loss:.4f} | val_loss={val_metrics['loss']:.4f} | "
+            f"val_acc={val_metrics['accuracy']:.3f} | val_f1_macro={val_metrics['f1_macro']:.3f}"
+        )
 
     MODELS_DIR.mkdir(exist_ok=True)
     out_path = MODELS_DIR / f"{model_name}.pth"
     torch.save(model.state_dict(), out_path)
     print(f"Modelo guardado em {out_path}")
-    return model
+    return model, pd.DataFrame(history)
 
 
 def save_summary(summaries: list[AugSummary], path: Path):
@@ -351,6 +432,21 @@ def save_summary(summaries: list[AugSummary], path: Path):
     return df
 
 
+def evaluate_on_final_test(model: nn.Module, model_name: str, base_key: str, classes_map: dict, classes_map_B: dict, batch_size: int = 128) -> tuple[dict, Path]:
+    """Avaliacao final para anexar métricas (accuracy/f1/loss) no conjunto de teste."""
+    test_df = load_final_test_df()
+    eval_df = build_train_df(test_df, base_key, classes_map, classes_map_B)
+    test_loader = make_loader(eval_df, test_transform, batch_size=batch_size)
+    criterion = nn.CrossEntropyLoss()
+    metrics = evaluate_loader_metrics(model, test_loader, criterion)
+    metrics_with_name = {"model": model_name, **metrics}
+    out_path = METRICS_DIR / f"{model_name}_final_test_metrics.csv"
+    METRICS_DIR.mkdir(exist_ok=True)
+    pd.DataFrame([metrics_with_name]).to_csv(out_path, index=False)
+    print(f"Métricas finais guardadas em {out_path}: {metrics_with_name}")
+    return metrics_with_name, out_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Balancear com CGAN por patamares e treinar modelos D e E.")
     parser.add_argument("--thresholds", type=str, default="500,1000,1500", help="Patamares alvo separados por virgula.")
@@ -364,6 +460,7 @@ def main():
     thresholds = tuple(int(x) for x in args.thresholds.split(","))
     seed_everything()
     train_df, classes_map, idx_to_class, anomaly_classes, classes_map_B = load_dataframes()
+    METRICS_DIR.mkdir(exist_ok=True)
 
     print(f"Balancing classes com thresholds {thresholds} ...")
     balanced_df, summaries = balance_with_tiers(train_df, classes_map, thresholds=thresholds, gan_batch_size=args.gan_batch_size)
@@ -374,9 +471,10 @@ def main():
         ("model_D_tiered", "B", len(anomaly_classes)),
         ("model_E_tiered", "C", len(classes_map)),
     ]
+    final_test_rows = []
     for name, base_key, num_classes in model_configs:
         df = build_train_df(balanced_df, base_key, classes_map, classes_map_B)
-        train_model(
+        model, history_df = train_model(
             model_name=name,
             base_df=df,
             num_classes=num_classes,
@@ -385,6 +483,20 @@ def main():
             use_weighted_sampler=True,
             batch_size=args.batch_size,
         )
+        history_csv = METRICS_DIR / f"{name}_history.csv"
+        history_df.to_csv(history_csv, index=False)
+        plot_path = METRICS_DIR / f"{name}_loss_curves.png"
+        plot_training_curves(history_df, plot_path, model_name=name)
+        print(f"Curvas de treino guardadas em {plot_path} e CSV em {history_csv}")
+
+        # Avaliação final para anexar métricas
+        metrics, metrics_path = evaluate_on_final_test(model, name, base_key, classes_map, classes_map_B, batch_size=args.batch_size)
+        final_test_rows.append(metrics)
+
+    if final_test_rows:
+        all_metrics_path = METRICS_DIR / "tiered_final_test_metrics.csv"
+        pd.DataFrame(final_test_rows).to_csv(all_metrics_path, index=False)
+        print(f"Métricas finais consolidadas em {all_metrics_path}")
 
     print("Pipeline completo.")
 
