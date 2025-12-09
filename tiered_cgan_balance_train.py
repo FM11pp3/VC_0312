@@ -30,7 +30,44 @@ import torchvision.utils as vutils
 from PIL import Image
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
+ 
+
+class FocalLoss(nn.Module):
+    """Focal Loss for multi-class classification using logits.
+    Works with integer class targets.
+    """
+    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # inputs: logits (batch, C)
+        # targets: (batch,)
+        log_probs = F.log_softmax(inputs, dim=-1)
+        probs = torch.exp(log_probs)
+
+        targets = targets.view(-1, 1)
+        log_pt = log_probs.gather(1, targets).view(-1)
+        pt = probs.gather(1, targets).view(-1)
+
+        if self.alpha is not None:
+            if isinstance(self.alpha, (list, tuple, torch.Tensor)):
+                alpha_t = torch.tensor(self.alpha, device=inputs.device)[targets.squeeze()]
+            else:
+                alpha_t = self.alpha
+            log_pt = log_pt * alpha_t
+
+        loss = - (1 - pt) ** self.gamma * log_pt
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
 
 REPO_ROOT = Path(__file__).parent.resolve()
 DATA_DIR = Path("/content/InfraredSolarModules") if Path("/content").exists() else REPO_ROOT / "InfraredSolarModules"
@@ -190,15 +227,7 @@ def load_trained_generator(num_classes: int):
     return generator
 
 
-def make_weighted_sampler(df: pd.DataFrame) -> WeightedRandomSampler:
-    class_counts = df["label"].value_counts()
-    class_weights = 1.0 / class_counts
-    sample_weights = df["label"].map(class_weights).astype(float)
-    return WeightedRandomSampler(
-        weights=torch.as_tensor(sample_weights.values, dtype=torch.double),
-        num_samples=len(sample_weights),
-        replacement=True,
-    )
+# WeightedRandomSampler removed: sampling is now handled via shuffle + FocalLoss and augmentation
 
 
 def evaluate_model(model: nn.Module, loader: DataLoader) -> float:
@@ -350,26 +379,26 @@ def plot_training_curves(history_df: pd.DataFrame, out_path: Path, model_name: s
     plt.close(fig)
 
 
-def train_model(model_name: str, base_df: pd.DataFrame, num_classes: int, epochs: int = 3, lr: float = 1e-3, use_weighted_sampler: bool = True, batch_size: int = 128):
+def train_model(model_name: str, base_df: pd.DataFrame, num_classes: int, epochs: int = 3, lr: float = 1e-3, batch_size: int = 128):
     train_split, val_split = train_test_split(
         base_df,
         test_size=0.2,
         stratify=base_df["label"],
         random_state=SEED,
     )
-    sampler = make_weighted_sampler(train_split) if use_weighted_sampler else None
+    # Use shuffled DataLoader (no WeightedRandomSampler). Class imbalance
+    # is mitigated via Focal Loss and data augmentation.
     train_loader = make_loader(
         train_split,
         train_transform,
         batch_size=batch_size,
-        shuffle=not use_weighted_sampler,
-        sampler=sampler,
+        shuffle=True,
     )
     val_loader = make_loader(val_split, test_transform, batch_size=batch_size)
 
     model = NetworkCNN(num_classes).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+    criterion = FocalLoss(gamma=2.0)
 
     history = []
     for epoch in range(epochs):
